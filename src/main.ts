@@ -1,20 +1,16 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
+import fetch from "node-fetch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
-const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
+const CUSTOM_API_KEY: string = core.getInput("CUSTOM_API_KEY");
+const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL"); // Если нужно
+const CUSTOM_API_ENDPOINT = "https://1vts9b3q5f9dgg-8000.proxy.runpod.net/";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  baseURL: "https://1vts9b3q5f9dgg-8000.proxy.runpod.net/ ",
-});
 
 interface PRDetails {
   owner: string;
@@ -26,7 +22,7 @@ interface PRDetails {
 
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
+    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
   const prResponse = await octokit.pulls.get({
     owner: repository.owner.login,
@@ -53,30 +49,8 @@ async function getDiff(
     pull_number,
     mediaType: { format: "diff" },
   });
-  // @ts-expect-error - response.data is a string
+  // @ts-expect-error
   return response.data;
-}
-
-async function analyzeCode(
-  parsedDiff: File[],
-  prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
-
-  for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
-    for (const chunk of file.chunks) {
-      const prompt = createPrompt(file, chunk, prDetails);
-      const aiResponse = await getAIResponse(prompt);
-      if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
-          comments.push(...newComments);
-        }
-      }
-    }
-  }
-  return comments;
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
@@ -88,10 +62,8 @@ function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 
-Review the following code diff in the file "${
-    file.to
-  }" and take the pull request title and description into account when writing the response.
-  
+Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
+
 Pull request title: ${prDetails.title}
 Pull request description:
 
@@ -104,7 +76,7 @@ Git diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
+  // @ts-expect-error
   .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
   .join("\n")}
 \`\`\`
@@ -115,34 +87,39 @@ async function getAIResponse(prompt: string): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
-  const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.2,
-    max_tokens: 700,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
-  };
-
   try {
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
+    const response = await fetch(CUSTOM_API_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${CUSTOM_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_API_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: prompt,
+          },
+        ],
+        temperature: 0.2,
+        max_tokens: 700,
+        top_p: 1,
+        frequency_penalty: 0,
+        presence_penalty: 0,
+      }),
     });
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    return JSON.parse(res).reviews;
+    if (!response.ok) {
+      console.error(`Custom API Error: ${response.status} ${response.statusText}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content?.trim() ?? "{}";
+    return JSON.parse(content).reviews;
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Error calling custom API:", error);
     return null;
   }
 }
@@ -156,15 +133,32 @@ function createComment(
   }>
 ): Array<{ body: string; path: string; line: number }> {
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
-      return [];
-    }
+    if (!file.to) return [];
     return {
       body: aiResponse.reviewComment,
       path: file.to,
       line: Number(aiResponse.lineNumber),
     };
   });
+}
+
+async function analyzeCode(
+  parsedDiff: File[],
+  prDetails: PRDetails
+): Promise<Array<{ body: string; path: string; line: number }>> {
+  const comments: Array<{ body: string; path: string; line: number }> = [];
+  for (const file of parsedDiff) {
+    if (file.to === "/dev/null") continue;
+    for (const chunk of file.chunks) {
+      const prompt = createPrompt(file, chunk, prDetails);
+      const aiResponse = await getAIResponse(prompt);
+      if (aiResponse) {
+        const newComments = createComment(file, chunk, aiResponse);
+        if (newComments) comments.push(...newComments);
+      }
+    }
+  }
+  return comments;
 }
 
 async function createReviewComment(
@@ -184,25 +178,19 @@ async function createReviewComment(
 
 async function main() {
   const prDetails = await getPRDetails();
-  let diff: string | null;
   const eventData = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
+  let diff: string | null = null;
+
   if (eventData.action === "opened") {
-    diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
-    );
+    diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
   } else if (eventData.action === "synchronize") {
-    const newBaseSha = eventData.before;
-    const newHeadSha = eventData.after;
+    const { before: newBaseSha, after: newHeadSha } = eventData;
 
     const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: "application/vnd.github.v3.diff",
-      },
+      headers: { accept: "application/vnd.github.v3.diff" },
       owner: prDetails.owner,
       repo: prDetails.repo,
       base: newBaseSha,
@@ -222,18 +210,18 @@ async function main() {
 
   const parsedDiff = parseDiff(diff);
 
-  const excludePatterns = core
-    .getInput("exclude")
+  const excludePatterns = core.getInput("exclude")
     .split(",")
     .map((s) => s.trim());
 
-  const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) =>
+  const filteredDiff = parsedDiff.filter((file) =>
+    !excludePatterns.some((pattern) =>
       minimatch(file.to ?? "", pattern)
-    );
-  });
+    )
+  );
 
   const comments = await analyzeCode(filteredDiff, prDetails);
+
   if (comments.length > 0) {
     await createReviewComment(
       prDetails.owner,
