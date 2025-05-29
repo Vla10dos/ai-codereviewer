@@ -13,7 +13,6 @@ const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
-  baseURL: "https://1vts9b3q5f9dgg-8000.proxy.runpod.net/",
 });
 
 interface PRDetails {
